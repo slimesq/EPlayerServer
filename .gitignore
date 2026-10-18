@@ -1,0 +1,36 @@
+# CMake build directories and generated files
+/build/
+/build-*/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Testing/
+/Makefile
+/build.ninja
+/rules.ninja
+/.ninja_deps
+/.ninja_log
+/compile_commands.json
+/CMakeUserPresets.json
+
+# Compiled outputs
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.exe
+/EPlayerServer
+
+# clangd caches
+/.cache/
+
+# Editor temporary files
+*.swp
+*.swo
+*~
