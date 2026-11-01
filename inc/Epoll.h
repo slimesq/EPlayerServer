@@ -109,6 +109,10 @@ public:
 public:
     CEpoll(CEpoll const&) = delete;
     CEpoll& operator=(CEpoll const&) = delete;
+    operator int() const
+    {
+        return m_epoll;
+    }
 
 public:
     int Create(unsigned count)
@@ -137,11 +141,12 @@ public:
             }
             return -2;
         }
-        if (ret > (int)evs.size())
+        if (ret > (int)events.size())
         {
-            evs.resize(ret);
+            events.resize(ret);
         }
-        memcpy(events.data(), evs.data(), sizeof(epoll_event) * ret);
+        if (ret > 0)
+            memcpy(events.data(), evs.data(), sizeof(epoll_event) * ret);
         return ret;
     }
     int Add(int fd, EpollData const& data = EpollData((void*)0), uint32_t events = EPOLLIN)
@@ -169,6 +174,10 @@ public:
         }
 
         return 0;
+    }
+    int Modify(int fd, uint32_t events, EpollData const& data = EpollData((void*)0))
+    {
+        return modify(fd, events, data);
     }
     int Del(int fd)
     {

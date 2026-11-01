@@ -34,3 +34,9 @@
 *.swp
 *.swo
 *~
+
+# Local runtime data and credentials
+/log/
+/.env
+/.env.local
+/text.txt

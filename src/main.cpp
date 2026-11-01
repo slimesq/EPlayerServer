@@ -1,66 +1,111 @@
-
-#include "Process.h"
-
+#include "EdoyunPlayerServer.h"
 #include <iostream>
-#include <sys/fcntl.h>
+#include <stdexcept>
 
-int CreateLogServer(CProcess* proc)
+namespace
 {
-    std::cout << __FILE__ << "(" << __LINE__ << ")"
-              << ":<" << __FUNCTION__ << "> pid=" << getpid() << std::endl;
+CServer* activeServer = nullptr;
 
+void StopServer(int)
+{
+    if (activeServer)
+        activeServer->RequestStop();
+}
+
+int LogProcess(CProcess* process)
+{
+    CLoggerServer logger;
+    int result = logger.Start();
+    process->NotifyReady(result);
+    if (result != 0)
+        return result;
+    int descriptor = -1;
+    process->RecvFD(descriptor);
+    if (descriptor >= 0)
+        close(descriptor);
+    logger.Close();
     return 0;
 }
 
-int CreateClientServer(CProcess* proc)
+unsigned Number(char const* value, unsigned maximum)
 {
-    // sleep(1);
-    int fd{-1};
-    int ret = proc->RecvFd(fd);
-    std::cout << __FILE__ << "(" << __LINE__ << ")"
-              << ":<" << __FUNCTION__ << "> pid=" << getpid() << " ret = " << ret << " fd = " << fd
-              << std::endl;
-    char buf[10] = "";
-    lseek(fd, 0, SEEK_SET);
-    read(fd, buf, sizeof(buf));
-    std::cout << "buf = \"" << buf << "\"" << std::endl;
-    close(fd);
-    return 0;
+    size_t end = 0;
+    unsigned long number = std::stoul(value, &end);
+    if (value[end] != '\0' || number == 0 || number > maximum)
+        throw std::invalid_argument("number out of range");
+    return static_cast<unsigned>(number);
 }
+}  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
-    // CProcess::SwitchDeamon();
-    CProcess proclog, procclients;
-    proclog.SetEntryFunction(CreateLogServer, &proclog);
-    int ret = proclog.CreateSubProcess();
-    if (ret == -1)
+    Buffer host = "0.0.0.0";
+    unsigned port = 9999, workers = 4;
+    try
     {
-        std::cout << __FILE__ << "(" << __LINE__ << ")"
-                  << ":<" << __FUNCTION__ << "> pid=" << getpid() << std::endl;
-        return -1;
+        for (int i = 1; i < argc; ++i)
+        {
+            std::string option = argv[i];
+            if (option == "--help")
+            {
+                std::cout
+                    << "Usage: EPlayerServer [--host IPv4] [--port 1..65535] [--workers 1..128]\n"
+                       "MySQL environment: EPLAYER_DB_HOST (127.0.0.1), EPLAYER_DB_PORT (3306),\n"
+                       "  EPLAYER_DB_USER (root), EPLAYER_DB_PASSWORD, EPLAYER_DB_NAME (edoyun).\n";
+                return 0;
+            }
+            if (i + 1 >= argc)
+                throw std::invalid_argument("missing option value");
+            char const* value = argv[++i];
+            if (option == "--host")
+                host = value;
+            else if (option == "--port")
+                port = Number(value, 65535);
+            else if (option == "--workers")
+                workers = Number(value, 128);
+            else
+                throw std::invalid_argument("unknown option");
+        }
+        in_addr address{};
+        if (inet_pton(AF_INET, host, &address) != 1)
+            throw std::invalid_argument("invalid IPv4 address");
     }
-    procclients.SetEntryFunction(CreateClientServer, &procclients);
-    ret = procclients.CreateSubProcess();
-    if (ret != 0)
+    catch (std::exception const& error)
     {
-        std::cout << __FILE__ << "(" << __LINE__ << ")"
-                  << ":<" << __FUNCTION__ << "> pid=" << getpid() << std::endl;
-        return -2;
+        std::cerr << error.what() << "; use --help for usage.\n";
+        return 2;
     }
 
-    int fd = open("./text.txt", O_RDWR | O_CREAT, 0644);
-    if (fd == -1)
+    CProcess logProcess;
+    logProcess.SetEntryFunction(LogProcess, &logProcess);
+    if (logProcess.CreateSubProcess() != 0 || logProcess.WaitReady() != 0)
     {
-        std::cout << __FILE__ << "(" << __LINE__ << ")"
-                  << ":<" << __FUNCTION__ << ">" << std::endl;
-        return -3;
+        std::cerr
+            << "Cannot start logger; check log directory permissions and existing server.sock.\n";
+        logProcess.SendFD(-1);
+        logProcess.Wait();
+        return 1;
     }
-    write(fd, "edoyun", 6);
-    ret = procclients.SendFD(fd);
-    std::cout << __FILE__ << "(" << __LINE__ << ")"
-              << ":<" << __FUNCTION__ << "> pid=" << getpid() << " fd = " << fd << std::endl;
-    close(fd);
-
-    return 0;
+    CEdoyunPlayerServer business(workers);
+    CServer server;
+    int result = server.Init(&business, host, static_cast<short>(port));
+    if (result == 0)
+    {
+        activeServer = &server;
+        struct sigaction action{};
+        action.sa_handler = StopServer;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGINT, &action, nullptr);
+        sigaction(SIGTERM, &action, nullptr);
+        std::cout << "EPlayerServer listening on " << host.c_str() << ':' << port << std::endl;
+        server.Run();
+        activeServer = nullptr;
+    }
+    else
+        std::cerr << "Server startup failed (" << result
+                  << "). Check MySQL configuration and listen port.\n";
+    server.Close();
+    logProcess.SendFD(-1);
+    logProcess.Wait();
+    return result == 0 ? 0 : 1;
 }

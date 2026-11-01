@@ -1,202 +1,131 @@
 #pragma once
 
-#include <unistd.h>
-#include <pthread.h>
-#include <fcntl.h>
+#include "Function.h"
+#include <atomic>
 #include <cerrno>
 #include <csignal>
-#include <cstdio>
 #include <ctime>
-#include <map>
-#include "Function.h"
+#include <mutex>
+#include <pthread.h>
+#include <unistd.h>
 
 class CThread
 {
 public:
-    CThread()
+    CThread() = default;
+    template <typename Function, typename... Args>
+    CThread(Function function, Args... args) : CThread()
     {
-        m_function = NULL;
-        m_thread = 0;
-        m_bpaused = false;
+        SetThreadFunc(function, args...);
     }
-
-    template <typename _FUNCTION_, typename... _ARGS_>
-    CThread(_FUNCTION_ func, _ARGS_... args)
-        : m_function(new CFunction<_FUNCTION_, _ARGS_...>(func, args...))
-    {
-    }
-
     ~CThread()
     {
+        Stop();
+        delete m_function;
     }
-
-public:
     CThread(CThread const&) = delete;
-    CThread operator=(CThread const&) = delete;
+    CThread& operator=(CThread const&) = delete;
 
-public:
-    template <typename _FUNCTION_, typename... _ARGS_>
-    int SetThreadFunc(_FUNCTION_ func, _ARGS_... args)
+    template <typename Function, typename... Args>
+    int SetThreadFunc(Function function, Args... args)
     {
-        m_function = new CFunction<_FUNCTION_, _ARGS_...>(func, args...);
-        if (m_function == NULL)
-        {
+        if (m_joinable)
             return -1;
-        }
+        auto* next = new CFunction<Function, Args...>(function, args...);
+        delete m_function;
+        m_function = next;
         return 0;
     }
     int Start()
     {
-        pthread_attr_t attr;
-        int ret = pthread_attr_init(&attr);
-        if (ret != 0)
-        {
+        if (m_joinable || !m_function)
             return -1;
-        }
-        ret = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-        if (ret != 0)
+        std::call_once(m_signalOnce, [] {
+            struct sigaction action{};
+            action.sa_handler = &CThread::PauseSignal;
+            sigemptyset(&action.sa_mask);
+            sigaction(SIGUSR1, &action, nullptr);
+        });
+        m_running = true;
+        int result = pthread_create(&m_thread, nullptr, &CThread::ThreadEntry, this);
+        if (result != 0)
         {
-            return -2;
+            m_running = false;
+            return -result;
         }
-        ret = pthread_attr_setdetachstate(&attr, PTHREAD_SCOPE_PROCESS);
-        if (ret != 0)
-        {
-            return -3;
-        }
-        ret = pthread_create(&m_thread, &attr, &CThread::ThreadEntry, this);
-        if (ret != 0)
-        {
-            return -4;
-        }
-        m_mapThread[m_thread] = this;
-
-        ret = pthread_attr_destroy(&attr);
-        if (ret != 0)
-        {
-            return -5;
-        }
+        m_joinable = true;
         return 0;
     }
-
     int Pause()
     {
-        if (m_thread != 0)
-        {
+        if (!m_running)
             return -1;
-        }
-        if (m_bpaused)
+        bool paused = !m_paused.load();
+        m_paused = paused;
+        if (paused)
         {
-            m_bpaused = false;  // 退出暂停
-            return 0;
-        }
-        m_bpaused = true;
-        int ret = pthread_kill(m_thread, SIGUSR1);
-        if (ret != 0)
-        {
-            m_bpaused = false;
-            return -2;
+            int result = pthread_kill(m_thread, SIGUSR1);
+            if (result)
+            {
+                m_paused = false;
+                return -result;
+            }
         }
         return 0;
     }
-
     int Stop()
     {
-        if (m_thread != 0)
+        if (!m_joinable)
+            return 0;
+        if (pthread_equal(pthread_self(), m_thread))
+            return -1;
+        m_running = false;
+        m_paused = false;
+        timespec deadline{};
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 100000000;
+        if (deadline.tv_nsec >= 1000000000)
         {
-            pthread_t thread = m_thread;
-            m_thread = 0;
-            timespec ts;
-            ts.tv_sec = 0;
-            ts.tv_nsec = 100 * 1000000;
-            int ret = pthread_timedjoin_np(thread, NULL, &ts);
-            if (ret == ETIMEDOUT)
-            {
-                pthread_detach(thread);
-                pthread_kill(thread, SIGUSR2);
-            }
+            ++deadline.tv_sec;
+            deadline.tv_nsec -= 1000000000;
         }
+        int result = pthread_timedjoin_np(m_thread, nullptr, &deadline);
+        if (result == ETIMEDOUT)
+        {
+            pthread_cancel(m_thread);
+            result = pthread_join(m_thread, nullptr);
+        }
+        if (result != 0)
+            return -result;
+        m_joinable = false;
+        m_thread = 0;
         return 0;
     }
-
     bool isValid() const
     {
-        return m_thread != 0;
+        return m_running.load();
     }
 
 private:
-    // __stdcall
-    static void* ThreadEntry(void* arg)
+    static void* ThreadEntry(void* argument)
     {
-        CThread* thiz = (CThread*)arg;
-
-        struct sigaction act = {0};
-        sigemptyset(&act.sa_mask);
-        act.sa_flags = SA_SIGINFO;
-        act.sa_sigaction = &CThread::Sigaction;
-        sigaction(SIGUSR1, &act, NULL);
-        sigaction(SIGUSR2, &act, NULL);
-
-        thiz->EnterThread();
-
-        if (thiz->m_thread)
-        {
-            thiz->m_thread = 0;
-        }
-        pthread_t thread = pthread_self();  // 不是冗余,有可能Sotp函数把m_thread给清零。
-        auto it = m_mapThread.find(thread);
-        if (it != m_mapThread.end())
-        {
-            m_mapThread[thread] = NULL;
-        }
-        pthread_detach(pthread_self());
-
-        pthread_exit(NULL);
+        auto* self = static_cast<CThread*>(argument);
+        m_current = self;
+        (*self->m_function)();
+        self->m_running = false;
+        m_current = nullptr;
+        return nullptr;
     }
-
-    static void Sigaction(int signo, siginfo_t* info, void* context)
+    static void PauseSignal(int)
     {
-        if (signo == SIGUSR1)
-        {
-            pthread_t thread = pthread_self();
-            auto it = m_mapThread.find(thread);
-            if (it != m_mapThread.end())
-            {
-                if (it->second)
-                {
-                    while (it->second->m_bpaused)
-                    {
-                        if (it->second->m_thread == 0)
-                        {
-                            pthread_exit(NULL);
-                        }
-                        usleep(1000);  // 1ms
-                    }
-                }
-            }
-        }
-        else if (signo == SIGUSR2)
-        {
-            // 线程退出
-            pthread_exit(NULL);
-        }
+        while (m_current && m_current->m_paused && m_current->m_running)
+            usleep(1000);
     }
-
-    // __thiscall
-    void EnterThread()
-    {
-        if (m_function != NULL)
-        {
-            int ret = (*m_function)();
-            if (ret != 0)
-            {
-                printf("%s(%d):[%s]ret = %d\n", __FILE__, __LINE__, __FUNCTION__, ret);
-            }
-        }
-    }
-
-private:
-    CFunctionBase* m_function;
-    pthread_t m_thread;
-    bool m_bpaused;  // true表示暂停， false表示运行中
-    static std::map<pthread_t, CThread*> m_mapThread;
+    CFunctionBase* m_function = nullptr;
+    pthread_t m_thread = 0;
+    bool m_joinable = false;
+    std::atomic<bool> m_running{false};
+    std::atomic<bool> m_paused{false};
+    static thread_local CThread* m_current;
+    static std::once_flag m_signalOnce;
 };

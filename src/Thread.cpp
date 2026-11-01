@@ -1,3 +1,4 @@
 #include "Thread.h"
 
-std::map<pthread_t, CThread*> CThread::m_mapThread{};
+thread_local CThread* CThread::m_current = nullptr;
+std::once_flag CThread::m_signalOnce;

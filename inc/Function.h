@@ -4,8 +4,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <functional>
+#include <utility>
 #include <memory.h>
 #include <signal.h>
+
+class CSocketBase;
+class Buffer;
 
 class CFunctionBase
 {
@@ -13,7 +17,18 @@ public:
     virtual ~CFunctionBase()
     {
     }
-    virtual int operator()() = 0;
+    virtual int operator()()
+    {
+        return -1;
+    }
+    virtual int operator()(CSocketBase*)
+    {
+        return -1;
+    }
+    virtual int operator()(CSocketBase*, Buffer const&)
+    {
+        return -1;
+    }
 };
 
 template <typename _FUNCTION_, typename... _ARGS_>

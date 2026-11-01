@@ -1,142 +1,216 @@
-
 #pragma once
 
 #include "Function.h"
+#include <cerrno>
+#include <csignal>
+#include <cstring>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 
 class CProcess
 {
 public:
-    CProcess()
-    {
-        m_func = NULL;
-        memset(m_socketFds, 0, sizeof(m_socketFds));
-    }
+    CProcess() = default;
     ~CProcess()
     {
-        if (m_func != NULL)
-        {
-            delete m_func;
-            m_func = NULL;
-        }
+        for (int descriptor : m_socketFds)
+            if (descriptor >= 0)
+                close(descriptor);
+        delete m_func;
     }
-    template <typename _FUNCTION_, typename... _ARGS_>
-    int SetEntryFunction(_FUNCTION_ func, _ARGS_... args)
+    CProcess(CProcess const&) = delete;
+    CProcess& operator=(CProcess const&) = delete;
+
+    template <typename Function, typename... Args>
+    int SetEntryFunction(Function function, Args... args)
     {
-        m_func = new CFunction(func, args...);
+        if (m_pid > 0)
+            return -1;
+        auto* next = new CFunction<Function, Args...>(function, args...);
+        delete m_func;
+        m_func = next;
         return 0;
     }
     int CreateSubProcess()
     {
-        if (m_func == NULL)
+        if (!m_func || m_pid > 0)
             return -1;
-        int ret = socketpair(AF_LOCAL, SOCK_STREAM, 0, m_socketFds);
-        if (ret == -1)
-            return -2;
-
-        pid_t pid = fork();
-        if (pid == -1)
-            return -2;
-        if (pid == 0)
+        for (int& descriptor : m_socketFds)
         {
-            // 子进程
-            close(m_socketFds[1]);  // 保留端点0,用于读写
-            m_socketFds[1] = 0;
-            ret = (*m_func)();
-            exit(0);
+            if (descriptor >= 0)
+                close(descriptor);
+            descriptor = -1;
         }
-        // 主进程
-        close(m_socketFds[0]);  // 保留端点1,用于读写
-        m_socketFds[0] = 0;
-        m_pid = pid;
+        m_notified = false;
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, m_socketFds) != 0)
+            return -2;
+        m_pid = fork();
+        if (m_pid < 0)
+        {
+            close(m_socketFds[0]);
+            close(m_socketFds[1]);
+            m_socketFds[0] = m_socketFds[1] = -1;
+            return -3;
+        }
+        if (m_pid == 0)
+        {
+            close(m_socketFds[1]);
+            m_socketFds[1] = -1;
+            // Ctrl+C 由父进程统一处理，再通过 IPC 通知子进程清理并退出。
+            signal(SIGINT, SIG_IGN);
+            signal(SIGTERM, SIG_DFL);
+            int result = (*m_func)();
+            if (!m_notified)
+                NotifyReady(result);
+            _exit(result == 0 ? 0 : 1);
+        }
+        close(m_socketFds[0]);
+        m_socketFds[0] = -1;
         return 0;
     }
-
-    // 主进程完成
-    int SendFD(int fd)
+    int SendFD(int descriptor)
     {
-        msghdr msg{};
-        iovec iov[2];
-        char buf[2][10] = {"edoyun", "jueding"};
-        iov[0].iov_base = buf[0];
-        iov[0].iov_len = sizeof(buf[0]);
-        iov[1].iov_base = buf[1];
-        iov[1].iov_len = sizeof(buf[1]);
-        msg.msg_iov = iov;
-        msg.msg_iovlen = 2;
+        return SendSocket(descriptor, nullptr);
+    }
+    int RecvFD(int& descriptor)
+    {
+        return RecvSocket(descriptor, nullptr);
+    }
+    int RecvFd(int& descriptor)
+    {
+        return RecvFD(descriptor);
+    }
 
-        // 下面的数据,才是我们需要传递的
-        cmsghdr* cmsg = (cmsghdr*)(calloc(1, CMSG_LEN(sizeof(int))));
-        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type = SCM_RIGHTS;
-        *(int*)CMSG_DATA(cmsg) = fd;
-        msg.msg_control = cmsg;
-        msg.msg_controllen = cmsg->cmsg_len;
-        ssize_t ret = sendmsg(m_socketFds[1], &msg, 0);
-        free(cmsg);
-        if (ret == -1)
+    int SendSocket(int descriptor, sockaddr_in const* address)
+    {
+        sockaddr_in payload{};
+        if (address)
+            payload = *address;
+        iovec vector{&payload, sizeof(payload)};
+        alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))]{};
+        msghdr message{};
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1;
+        if (descriptor >= 0)
         {
+            message.msg_control = control;
+            message.msg_controllen = sizeof(control);
+            cmsghdr* header = CMSG_FIRSTHDR(&message);
+            header->cmsg_level = SOL_SOCKET;
+            header->cmsg_type = SCM_RIGHTS;
+            header->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(header), &descriptor, sizeof(descriptor));
+        }
+        ssize_t sent;
+        do
+        {
+            sent = sendmsg(m_socketFds[1], &message, MSG_NOSIGNAL);
+        } while (sent < 0 && errno == EINTR);
+        return sent == sizeof(payload) ? 0 : -1;
+    }
+    int RecvSocket(int& descriptor, sockaddr_in* address)
+    {
+        descriptor = -1;
+        sockaddr_in payload{};
+        iovec vector{&payload, sizeof(payload)};
+        alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))]{};
+        msghdr message{};
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1;
+        message.msg_control = control;
+        message.msg_controllen = sizeof(control);
+        ssize_t received;
+        do
+        {
+            received = recvmsg(m_socketFds[0], &message, MSG_CMSG_CLOEXEC);
+        } while (received < 0 && errno == EINTR);
+        if (received != sizeof(payload) || (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)))
             return -1;
-        }
-        return 0;
-    }
-
-    // 子进程
-    int RecvFd(int& fd)
-    {
-        msghdr msg{};
-        iovec iov[2];
-        char buf[][10] = {"", ""};
-        iov[0].iov_base = buf[0];
-        iov[0].iov_len = sizeof(buf[0]);
-        iov[1].iov_base = buf[1];
-        iov[1].iov_len = sizeof(buf[1]);
-        msg.msg_iov = iov;
-        msg.msg_iovlen = 2;
-
-        cmsghdr* cmsg = (cmsghdr*)calloc(1, CMSG_LEN(sizeof(int)));
-        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type = SCM_RIGHTS;
-        msg.msg_control = cmsg;
-        msg.msg_controllen = CMSG_LEN(sizeof(int));
-        ssize_t ret = recvmsg(m_socketFds[0], &msg, 0);
-        if (ret == -1)
+        if (address)
+            *address = payload;
+        for (cmsghdr* header = CMSG_FIRSTHDR(&message); header;
+             header = CMSG_NXTHDR(&message, header))
         {
-            free(cmsg);
-            return -2;
+            if (header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS &&
+                header->cmsg_len >= CMSG_LEN(sizeof(int)))
+            {
+                memcpy(&descriptor, CMSG_DATA(header), sizeof(descriptor));
+                break;
+            }
         }
-        fd = *(int*)CMSG_DATA(cmsg);
-        free(cmsg);
         return 0;
     }
-
+    int NotifyReady(int status)
+    {
+        m_notified = true;
+        return send(m_socketFds[0], &status, sizeof(status), MSG_NOSIGNAL) == sizeof(status) ? 0
+                                                                                             : -1;
+    }
+    int WaitReady(int timeout = 5000)
+    {
+        pollfd event{m_socketFds[1], POLLIN, 0};
+        int result;
+        do
+        {
+            result = poll(&event, 1, timeout);
+        } while (result < 0 && errno == EINTR);
+        if (result <= 0)
+            return -1;
+        int status = -1;
+        return recv(m_socketFds[1], &status, sizeof(status), 0) == sizeof(status) ? status : -1;
+    }
+    int Wait(int timeout = 3000)
+    {
+        if (m_pid <= 0)
+            return 0;
+        int status = 0;
+        for (int elapsed = 0; elapsed < timeout; elapsed += 10)
+        {
+            pid_t result = waitpid(m_pid, &status, WNOHANG);
+            if (result == m_pid || (result < 0 && errno == ECHILD))
+            {
+                m_pid = -1;
+                return status;
+            }
+            if (result < 0 && errno != EINTR)
+                return -1;
+            usleep(10000);
+        }
+        kill(m_pid, SIGTERM);
+        while (waitpid(m_pid, &status, 0) < 0 && errno == EINTR)
+        {
+        }
+        m_pid = -1;
+        return status;
+    }
     static int SwitchDeamon()
     {
-        pid_t ret = fork();
-        if (ret == -1)
+        pid_t pid = fork();
+        if (pid < 0)
             return -1;
-        if (ret > 0)
-            exit(0);  // 主进程到此为止
-        // 子进程内容如下
-        ret = setsid();
-        if (ret == -1)
-            return -2;  // 失败,则返回
-        ret = fork();
-        if (ret == -1)
+        if (pid > 0)
+            _exit(0);
+        if (setsid() < 0)
+            return -2;
+        pid = fork();
+        if (pid < 0)
             return -3;
-        if (ret > 0)
-            exit(0);  // 子进程到此为止
+        if (pid > 0)
+            _exit(0);
         for (int i = 0; i < 3; ++i)
             close(i);
         umask(0);
         signal(SIGCHLD, SIG_IGN);
-
         return 0;
     }
 
 private:
-    CFunctionBase* m_func;
-    pid_t m_pid;
-    int m_socketFds[2];
+    CFunctionBase* m_func = nullptr;
+    pid_t m_pid = -1;
+    int m_socketFds[2]{-1, -1};
+    bool m_notified = false;
 };
